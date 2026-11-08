@@ -65,6 +65,7 @@ h2{margin:0 0 8px;font-size:12px;letter-spacing:.12em;color:var(--muted);font-we
 .addr.pending button[type=submit]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:700}
 .addr input{flex:1;min-width:0;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:8px 10px;min-height:40px}
 .hits{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
+.hits button.dim{color:var(--muted)}                                        /* 入力した文字を含まない候補 */
 .hits button{width:100%;text-align:left;border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:6px 10px;cursor:pointer}
 .hits button:hover{background:var(--soft)}
 .timebox{display:flex;align-items:baseline;gap:8px;margin-bottom:4px}
@@ -398,8 +399,9 @@ function pip(p, x, y){
   }
   return inside;
 }
-function stitch(parts){                       // 分かれた外周の線をつないで輪にする
-  const rings = [], pool = parts.filter(p => p.length > 1);
+// 分かれた外周の線をつないで輪にする。輪にならなかった線（取得範囲の外まで続く大きな面の一部）は open に入れる
+function stitch(parts){
+  const rings = [], open = [], pool = parts.filter(p => p.length > 1);
   while(pool.length){
     let cur = pool.pop();
     while(cur[0] !== cur[cur.length-1]){
@@ -413,9 +415,9 @@ function stitch(parts){                       // 分かれた外周の線をつ�
       const q = pool.splice(found,1)[0]; if(rev) q.reverse();
       cur = cur.concat(q.slice(1));
     }
-    if(cur.length >= 4 && cur[0] === cur[cur.length-1]) rings.push(cur);
+    if(cur.length >= 4 && cur[0] === cur[cur.length-1]) rings.push(cur); else open.push(cur);
   }
-  return rings;
+  return {rings, open};
 }
 // 道ごとの環境（ENV_* のビットの組み合わせ）
 //   公園・緑地：多角形の中にある道 / 水辺：岸や川から30m以内 / 木陰：並木から20m以内、街路樹が並ぶ、林の中か縁 / 田畑：田畑の中か縁から25m以内
@@ -456,7 +458,9 @@ function computeEnv(raw, wayById, ways, rels, ea, eb, elen, X, Y, lat0, lon0, kx
       const w = wayById.get(mem.ref); if(w && w.nodes && w.nodes.length > 1) parts.push(w.nodes.slice());
     }
     if(k & ENV_WATER){ for(const nodes of parts) addLine(nodes, ENV_WATER, 30); continue; }
-    for(const ring of stitch(parts)) addArea(ring, k);
+    const {rings, open} = stitch(parts);
+    for(const ring of rings) addArea(ring, k);
+    for(const nodes of open) addLine(nodes, k, k & ENV_FARM ? 25 : k & ENV_SHADE ? 15 : 10);   // 範囲外まで続く面は、縁の線だけで判定する
   }
   const eenv = new Uint8Array(m);
   if(!polys.length && !segs.length && !trees.length) return eenv;
@@ -931,7 +935,8 @@ async function planLoops(G, opt, progress){
 <script>
 /* ---------- 画面 ---------- */
 const $ = id => document.getElementById(id);
-const ENDPOINTS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+// 道路データ（Overpass）の公開サーバー。上から順に使い、混んでいれば次へ切り替える
+const ENDPOINTS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter'];
 const GROUP_META = [
   {name:'歩行者・自転車専用路', v:'--free'},
   {name:'住宅街・一般の道', v:'--gen'},
@@ -1040,21 +1045,40 @@ $('btnGps').addEventListener('click', () => {
     {enableHighAccuracy:true, timeout:15000}
   );
 });
+// 住所・場所名から候補を探す。3つの情報源を同時に当たり、入力した文字を含む候補（match）を前に並べる
+//   地理院の住所検索：住所に強いが、駅名などの場所名には別の場所を返すことがある
+//   HeartRails Express：駅名そのもの（「駅」を除いた名前で引く）
+//   Nominatim（OpenStreetMap）：駅・公園・店などの場所名
 async function geocode(q){
-  let list = [];
-  try{
-    const r = await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q='+encodeURIComponent(q));
-    const j = await r.json();
-    list = j.slice(0,5).map(x => ({label:x.properties.title, lat:x.geometry.coordinates[1], lon:x.geometry.coordinates[0]}));
-  }catch(e){}
-  if(!list.length){
-    try{
-      const r = await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=jp&accept-language=ja&q='+encodeURIComponent(q));
-      const j = await r.json();
-      list = j.map(x => ({label:x.display_name, lat:parseFloat(x.lat), lon:parseFloat(x.lon)}));
-    }catch(e){}
+  const norm = s => (s || '').replace(/[\s　]/g, '');
+  const q0 = norm(q), q1 = q0.replace(/(駅|停留所|バス停)$/, '');
+  const stationy = /(駅|停留所|バス停)$/.test(q0);
+  const get = async (url, pick) => {                                   // 1つの情報源。失敗や7秒超は空扱い
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 7000);
+    try{ const r = await fetch(url, {signal:ctl.signal}); return pick(await r.json()) || []; }
+    catch(e){ return []; }
+    finally{ clearTimeout(to); }
+  };
+  const [gsi, st, nomi] = await Promise.all([
+    get('https://msearch.gsi.go.jp/address-search/AddressSearch?q='+encodeURIComponent(q),
+      j => j.slice(0,5).map(x => ({label:x.properties.title, lat:x.geometry.coordinates[1], lon:x.geometry.coordinates[0]}))),
+    q1.length >= 2 ? get('https://express.heartrails.com/api/json?method=getStations&name='+encodeURIComponent(q1),
+      j => ((j.response && j.response.station) || []).map(x => ({label:x.name+'駅（'+x.line+'・'+x.prefecture+'）', lat:+x.y, lon:+x.x}))) : [],
+    q0.length >= 2 ? get('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=jp&accept-language=ja&q='+encodeURIComponent(q),
+      j => j.map(x => { const parts = x.display_name.split(', '); return {label: x.name ? x.name+'（'+parts.slice(1,3).join('、')+'）' : x.display_name, lat:parseFloat(x.lat), lon:parseFloat(x.lon)}; })) : []
+  ]);
+  const all = stationy ? [...st, ...nomi, ...gsi] : [...gsi, ...nomi, ...st];   // 「駅」で終わるなら駅名の情報源を先に
+  const out = [];
+  for(const c of all){
+    if(!isFinite(c.lat) || !isFinite(c.lon)) continue;
+    if(out.some(o => meters(o, c) < 100)) continue;                     // 同じ場所が複数の情報源から来たら1つに
+    const L = norm(c.label);
+    c.score = L.includes(q0) ? 3 : (q1.length >= 2 && L.includes(q1)) ? 2 : 0;
+    c.match = c.score > 0;                                               // 入力した文字を含む候補だけが自動採用の対象
+    out.push(c);
   }
-  return list;
+  out.sort((a,b) => b.score - a.score);                                  // 同点は情報源の順のまま
+  return out.slice(0, 6);
 }
 /* ---------- 住所・場所名の検索欄（出発地と目的地で共通） ----------
    文字を入れて手が止まると自動で候補を出す。Enter・検索ボタン・欄から離れる・欄を閉じる・コースを探す・出発地に戻る、
@@ -1073,6 +1097,7 @@ function placeSearch(cfg){
     if(!st.list) return;
     st.list.forEach((h, i) => {
       const li = document.createElement('li'); const b = document.createElement('button'); b.type = 'button'; b.textContent = h.label;
+      if(!h.match) b.classList.add('dim');                                   // 入力した文字を含まない候補は薄く
       b.setAttribute('aria-pressed', st.applied === st.q && i === st.chosen);
       b.addEventListener('click', () => { pick(i); open(false); });        // 自分で候補を選んだら欄を閉じる
       li.appendChild(b); hits.appendChild(li);
@@ -1091,17 +1116,19 @@ function placeSearch(cfg){
       if(seq !== st.seq) return;
       st.list = list; st.searching = null; renderHits();
       if(!list.length) showLabel('「'+q+'」は見つかりませんでした。町名や駅名で試すか、地図で選んでください。', 'err');
+      else if(!list[0].match) showLabel('「'+q+'」にぴったりの候補がありません。下の候補が違えば、書き方を変えるか地図で選んでください。', 'err');
       else showLabel('「'+q+'」の候補から選んでください（選ばなければ1番目を使います）', 'pending');
     });
     return st.searching;
   }
-  // 未確定の入力があれば候補の1番目を採用する。採用できたか、何もすることがなければ true。見つからなければ false
-  async function commit(){
+  // 未確定の入力があれば、入力した文字に合う候補の1番目を採用する。採用できたか、何もすることがなければ true
+  // 合う候補がなければ false（reason が 'blur' でなければ入力欄に戻す）。合わない候補を勝手に使うことはしない
+  async function commit(reason){
     if(!st.q || st.applied === st.q) return true;
     clearTimeout(st.timer);
     for(let tries = 0; tries < 3 && st.q && !st.list; tries++) await (st.searching || lookup());
     if(!st.q || st.applied === st.q) return true;                           // 待っている間に消した・選んだ
-    if(!st.list || !st.list.length){ input.focus(); return false; }
+    if(!st.list || !st.list.length || !st.list[0].match){ if(reason !== 'blur') input.focus(); return false; }
     pick(0);
     toast('「'+st.list[0].label+'」を'+cfg.what+'にしました');
     return true;
@@ -1120,9 +1147,9 @@ function placeSearch(cfg){
     showLabel('「'+q+'」の候補を探します…', 'pending');
     st.timer = setTimeout(lookup, 700);
   });
-  form.addEventListener('submit', ev => { ev.preventDefault(); commit(); });
-  input.addEventListener('blur', () => { setTimeout(commit, 150); });     // 候補のタップが先に処理されるよう少し待つ
-  btn.addEventListener('click', () => { if(form.hidden) open(true); else { open(false); commit(); } });
+  form.addEventListener('submit', ev => { ev.preventDefault(); commit('submit'); });
+  input.addEventListener('blur', () => { setTimeout(() => commit('blur'), 150); });     // 候補のタップが先に処理されるよう少し待つ
+  btn.addEventListener('click', () => { if(form.hidden) open(true); else commit('close').then(ok => { if(ok) open(false); }); });   // 決まらないうちは閉じない
   return {commit, reset};
 }
 const homeSearch = placeSearch({formId:'addrForm', inputId:'addrInput', hitsId:'hits', btnId:'btnAddr', labelId:'homeLabel', what:'出発地',
@@ -1249,54 +1276,83 @@ async function cachePut(entry){
 }
 
 // 範囲 area の道路・緑地・施設を取る。2点が違えば、2点を結ぶ線から R m 以内の帯状の範囲になる（Overpass の around は線にも使える）
-function overpassQuery(area){
+// timeoutSec はサーバー側の打ち切り時間。短いほど混んだサーバーに受け付けられやすい
+function overpassQuery(area, timeoutSec){
   const pts = (area.lat2 === area.lat && area.lon2 === area.lon) ? area.lat+','+area.lon : area.lat+','+area.lon+','+area.lat2+','+area.lon2;
   const a = '(around:'+area.R+','+pts+')';
-  return '[out:json][timeout:150];('
+  return '[out:json][timeout:'+timeoutSec+'];('
     + 'way["highway"~"^(footway|path|pedestrian|cycleway|track|steps|bridleway|living_street|residential|service|unclassified|road|tertiary|tertiary_link|secondary|secondary_link|primary|primary_link|trunk|trunk_link)$"]["area"!="yes"]["service"!~"^(driveway|parking_aisle|drive-through)$"]'+a+';'
     + 'way["leisure"~"^(park|garden|nature_reserve)$"]'+a+';'
     + 'way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|farmland|orchard|allotments|paddy|vineyard)$"]'+a+';'
     + 'way["natural"~"^(wood|scrub|grassland|wetland|water|coastline|tree_row)$"]'+a+';'
     + 'way["waterway"~"^(river|stream|canal)$"]'+a+';'
     + 'node["natural"="tree"]'+a+';'                                                     // 街路樹など1本ずつの木（並木・木陰の判定に使う）
-    + 'relation["leisure"~"^(park|garden|nature_reserve)$"]'+a+';'
-    + 'relation["natural"~"^(wood|wetland|water)$"]'+a+';'
-    + 'relation["landuse"~"^(forest|grass|meadow|recreation_ground|farmland|orchard|allotments|paddy|vineyard)$"]'+a+';'
-    + ');(._;>;);out body qt;'
+    + 'relation["leisure"~"^(park|garden|nature_reserve)$"]'+a+';'                       // 公園は小さいので、範囲外の部分も含めて丸ごと取る
+    + ')->.a;'
+    // 川・湖・森・田畑の関係（relation）は範囲のはるか外まで続くことがあり、丸ごと取ると重い。関係そのものと、範囲内にあるメンバーの線だけ取る
+    + '(relation["natural"~"^(wood|wetland|water)$"]'+a+';'
+    + 'relation["landuse"~"^(forest|grass|meadow|recreation_ground|farmland|orchard|allotments|paddy|vineyard)$"]'+a+';)->.big;'
+    + 'way(r.big)'+a+'->.bw;'
+    + '(.a; .a >; .big; .bw; .bw >;);out body qt;'
     + '(node["amenity"~"^(toilets|vending_machine|bench|cafe|restaurant|fast_food|pharmacy)$"]'+a+';'
     + 'way["amenity"~"^(toilets|cafe|restaurant|fast_food|pharmacy)$"]'+a+';'
     + 'node["shop"~"^(convenience|supermarket|chemist|drugstore)$"]'+a+';'
     + 'way["shop"~"^(convenience|supermarket|chemist|drugstore)$"]'+a+';);out center;';
 }
 
-// 2つのサーバーのうち先に返ってきた方を使う（2つ目は7秒待ってから、または1つ目が失敗したらすぐ開始）
-function fetchOsm(area){
-  const q = overpassQuery(area);
-  return new Promise((resolve, reject) => {
-    const ctls = ENDPOINTS.map(() => new AbortController());
-    const started = ENDPOINTS.map(() => false);
-    let fails = 0, done = false, lateTimer = null;
-    const go = i => {
-      if(i < 0 || i >= ENDPOINTS.length || started[i]) return; started[i] = true;
-      const to = setTimeout(() => ctls[i].abort(), 150000);
-      fetch(ENDPOINTS[i], {method:'POST', body:'data='+encodeURIComponent(q), headers:{'Content-Type':'application/x-www-form-urlencoded'}, signal:ctls[i].signal})
-        .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
-        .then(text => {
-          clearTimeout(to); if(done) return;
-          const json = JSON.parse(text);
-          if(!json.elements || !json.elements.length) throw new Error('empty');
-          done = true; clearTimeout(lateTimer);
-          ctls.forEach((c,k) => { if(k !== i) c.abort(); });
-          resolve({json, text});
-        })
-        .catch(err => {
-          clearTimeout(to); if(done) return;
-          fails++; go(started.indexOf(false));
-          if(fails >= ENDPOINTS.length) reject(err);
-        });
-    };
-    go(0); lateTimer = setTimeout(() => go(1), 7000);
-  });
+// 道路データの取得。1回で済まないことが多いので、自動で何度か試す
+//   ・試行ごとの打ち切り時間（秒）。1回目は短め。時間切れなら同じサーバーで長めに再試行する（2回目はサーバーの処理が温まっていて速い）
+//   ・サーバーが混んでいる（429/503/504）か通信できないときは、すぐ別のサーバーに切り替える。同じサーバーで2回時間切れになっても切り替える
+//   ・同時に2つ送らない（公開サーバーは1つの端末からの同時実行を2つまでに制限していて、超えると断られる）
+const FETCH_PLAN = [45, 90, 150, 150];
+let sleep = ms => new Promise(r => setTimeout(r, ms));
+// rec.say(msg) で進み具合を画面に出す。失敗したときは err.kind に 'busy' / 'timeout' / 'network' / 'empty' / 'other' を入れて投げる
+async function fetchOsm(area, rec){
+  let server = 0, slowOnSame = 0, lastErr = null;
+  for(let attempt = 0; attempt < FETCH_PLAN.length; attempt++){
+    const timeoutSec = FETCH_PLAN[attempt], url = ENDPOINTS[server], t0 = Date.now();
+    const ctl = new AbortController();
+    const kill = setTimeout(() => ctl.abort(), (timeoutSec + 45)*1000);                  // サーバー側の打ち切りより、受信の時間ぶん長く待つ
+    const tick = setInterval(() => rec.say(rec.where+'の道路データを取得しています…（'+(attempt+1)+'回目、'+Math.round((Date.now()-t0)/1000)+'秒）'
+      + (attempt ? '' : ' 初回は時間がかかります。次回からは保存したデータを使います')), 1000);
+    rec.say(rec.where+'の道路データを取得しています…（'+(attempt+1)+'回目）');
+    let kind = 'other', wait = 2000;
+    try{
+      const r = await fetch(url, {method:'POST', body:'data='+encodeURIComponent(overpassQuery(area, timeoutSec)),
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}, signal:ctl.signal});
+      if(r.status === 429 || r.status === 503 || r.status === 504) throw Object.assign(new Error('HTTP '+r.status), {kind:'busy'});
+      if(!r.ok) throw Object.assign(new Error('HTTP '+r.status), {kind:'other', fatal:true});   // 400 などはクエリの問題なので試し直しても同じ
+      const text = await r.text();
+      const json = JSON.parse(text);
+      if(json.elements && json.elements.length) return {json, text};
+      if(json.remark && /timed out/i.test(json.remark)) throw Object.assign(new Error(json.remark), {kind:'timeout'});
+      if(json.remark) throw Object.assign(new Error(json.remark), {kind:'busy'});          // メモリ不足など、サーバー側の都合
+      throw Object.assign(new Error('empty'), {kind:'empty', fatal:true});                 // 本当に何もない範囲
+    }catch(err){
+      clearTimeout(kill); clearInterval(tick);
+      if(err.name === 'AbortError') kind = 'timeout';
+      else if(err.kind) kind = err.kind;
+      else if(err instanceof TypeError) kind = 'network';                                   // 通信できない・CORSで読めない応答
+      lastErr = Object.assign(err, {kind});
+      if(err.fatal) break;
+      if(kind === 'timeout' && ++slowOnSame < 2){ wait = 3000; }                           // 遅いだけなら同じサーバーで長めにもう一度
+      else { server = (server + 1) % ENDPOINTS.length; slowOnSame = 0; wait = kind === 'busy' ? 8000 : 3000; }
+      if(attempt + 1 < FETCH_PLAN.length){
+        const why = kind === 'busy' ? 'サーバーが混んでいます' : kind === 'timeout' ? '時間切れでした' : '通信に失敗しました';
+        rec.say(why+'。'+Math.round(wait/1000)+'秒待って、もう一度試します…（'+(attempt+2)+'回目）');
+        await sleep(wait);
+      }
+      continue;
+    }finally{ clearTimeout(kill); clearInterval(tick); }
+  }
+  throw lastErr || Object.assign(new Error('fetch failed'), {kind:'other'});
+}
+// 取得に失敗したときの案内
+function fetchFailText(e){
+  const k = e && e.kind;
+  if(k === 'busy' || k === 'timeout') return '道路データのサーバーが混んでいて取得できませんでした（'+FETCH_PLAN.length+'回試しました）。少し待ってからもう一度お試しください。';
+  if(k === 'empty') return 'この範囲には道路データがありませんでした。出発地の位置を確認してください。';
+  return '道路データを取得できませんでした。通信状況を確認して、もう一度お試しください。';
 }
 
 function bucketR(L){
@@ -1317,31 +1373,37 @@ function covers(c, need){
   return true;
 }
 
-function ensureOsm(area, quiet){
-  if(S.osm && covers(S.osmArea, area)) return Promise.resolve(S.osm);
-  if(S.inflight && covers(S.inflight, area)) return S.inflight.p;
+// 範囲 area の道路データを用意する。手持ち → 保存データ（IndexedDB）→ サーバー、の順。quiet なら画面に経過を出さない
+async function ensureOsm(area, quiet){
+  if(S.osm && covers(S.osmArea, area)) return S.osm;
+  if(S.inflight){
+    if(covers(S.inflight, area)){ if(!quiet) S.inflight.verbose = true; return S.inflight.p; }   // 先読み中のものを待つ。経過も見せる
+    if(!quiet) setStatus('別の範囲の道路データを取得中です。終わってから続けます…');
+    await S.inflight.p.catch(() => {});                                                           // 同時に2つ送らず、順番に
+    return ensureOsm(area, quiet);
+  }
   const band = area.lat2 !== area.lat || area.lon2 !== area.lon;        // 出発地と行き先を結ぶ帯状の範囲
-  const p = (async () => {
+  const rec = {lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R, verbose:!quiet, p:null,
+    where: band ? (area.name || '出発地から行き先まで') : '周辺'};
+  rec.say = msg => { if(rec.verbose) setStatus(msg); };
+  rec.p = (async () => {
     const now = Date.now();
     for(const e of await cacheAll()){
       if(e.v === DATA_VER && now - e.t < 30*864e5 && covers(e, area)){
-        if(!quiet) setStatus('保存してある道路データを読み込んでいます…');
+        rec.say('保存してある道路データを読み込んでいます…');
         const j = JSON.parse(e.text);
         S.osm = j; S.osmArea = {lat:e.lat, lon:e.lon, lat2:e.lat2, lon2:e.lon2, R:e.R}; resetGraph(); return j;
       }
     }
-    if(!quiet) setStatus(band ? (area.name || '出発地から行き先まで')+'の道路データを取得しています…（距離が長いほど時間がかかります。次回からは保存したデータを使います）'
-                             : '周辺の道路データを取得しています…（初回だけ時間がかかります。次回からは保存したデータを使います）');
-    const {json, text} = await fetchOsm(area);
+    const {json, text} = await fetchOsm(area, rec);
     S.osm = json; S.osmArea = {lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R}; resetGraph();
     cachePut({id:[area.lat.toFixed(5), area.lon.toFixed(5), area.lat2.toFixed(5), area.lon2.toFixed(5), area.R].join(','), v:DATA_VER,
       lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R, t:Date.now(), text});
     return json;
   })();
-  const rec = {lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R, p};
   S.inflight = rec;
-  p.finally(() => { if(S.inflight === rec) S.inflight = null; }).catch(() => {});
-  return p;
+  rec.p.finally(() => { if(S.inflight === rec) S.inflight = null; }).catch(() => {});
+  return rec.p;
 }
 
 // 起動時・出発地や目的地を決めたとき・タブを切り替えたときに、探す前から道路データとグラフを用意しておく
@@ -1394,7 +1456,7 @@ async function search(alt){
     }
   }catch(e){
     if(e && e.message === 'NOROAD') setStatus('出発地の近くに歩ける道路データが見つかりませんでした。位置を確認してください。', true);
-    else setStatus('道路データを取得できませんでした。通信状況を確認して、もう一度お試しください。', true);
+    else setStatus(fetchFailText(e), true);
   }finally{
     setBusy(false); setProgress(null);
   }
@@ -1402,8 +1464,8 @@ async function search(alt){
 // 「コースを探す」はタブに応じて一周／目的地を探す
 // 住所の欄に未確定の入力が残っていれば、先に候補の1番目を採用してから探す
 $('go').addEventListener('click', async () => {
-  if(!await homeSearch.commit()) return;
-  if(S.mode === 'dest' && !await destSearch.commit()) return;
+  if(!await homeSearch.commit('go')) return;
+  if(S.mode === 'dest' && !await destSearch.commit('go')) return;
   S.mode === 'dest' ? searchDest(false) : search(false);
 });
 // 「別のコースを探す」は、タブではなく表示中のコースと同じ種類で探す（結果を見たあとにタブを切り替えても種類が変わらないように）
@@ -1486,14 +1548,14 @@ async function searchDest(alt){
     if(m === 'NOROAD') setStatus('出発地の近くに歩ける道路データが見つかりませんでした。位置を確認してください。', true);
     else if(m === 'NODEST') setStatus('目的地の近くに歩ける道路データがありません。道路に近い場所を選び直してください。', true);
     else if(m === 'NEAR') setStatus('目的地が出発地に近すぎます。別の場所を選んでください。', true);
-    else setStatus('道路データを取得できませんでした。通信状況を確認して、もう一度お試しください。', true);
+    else setStatus(fetchFailText(e), true);
   }finally{ setBusy(false); setProgress(null); }
 }
 
 // 現在地から出発地まで、いまの設定（安全な横断・緑の優先）で戻る道を出す
 async function backHome(){
   if(busy) return;
-  if(!await homeSearch.commit()) return;                                 // 住所の欄に未確定の入力があれば先に採用する
+  if(!await homeSearch.commit('go')) return;                                 // 住所の欄に未確定の入力があれば先に採用する
   if(!S.home){ toast('先に出発地を設定してください'); return; }
   if(!navigator.geolocation){ toast('この端末では現在地を取得できません'); return; }
   setBusy(true); setProgress(null); setStatus('現在地を確認しています…');
@@ -1519,7 +1581,7 @@ async function backHome(){
     else if(m === 'NOROAD') setStatus('出発地の近くに歩ける道路データが見つかりませんでした。', true);
     else if(m === 'NOHERE') setStatus('現在地の近くに歩ける道路データがありません。', true);
     else if(m === 'NOPATH') setStatus('現在地から出発地までの道が見つかりませんでした。', true);
-    else setStatus('道路データを取得できませんでした。通信状況を確認して、もう一度お試しください。', true);
+    else setStatus(fetchFailText(e), true);
   }finally{ setBusy(false); setProgress(null); }
 }
 $('btnHome').addEventListener('click', backHome);
