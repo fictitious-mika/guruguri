@@ -16,6 +16,7 @@
   --accent:#17695A; --accent-ink:#FFFFFF; --soft:#E6EEE9;
   --out:#1E6FE0; --back:#EA7A1C;
   --free:#1E9E5A; --gen:#7F90A6; --walk:#D9A21B; --busy:#D23B2E;
+  --warn-ink:#8A6508;
   --font:"Zen Maru Gothic","Hiragino Maru Gothic ProN","Hiragino Sans","Noto Sans JP",system-ui,sans-serif;
 }
 @media (prefers-color-scheme: dark){
@@ -24,6 +25,7 @@
     --accent:#4CC3A8; --accent-ink:#06211B; --soft:#22302B;
     --out:#5B9BFF; --back:#FF9A4D;
     --free:#3CC47C; --gen:#8FA1B8; --walk:#E8B63A; --busy:#F0645A;
+    --warn-ink:#E8B63A;
     color-scheme:dark;
   }
 }
@@ -57,7 +59,10 @@ h2{margin:0 0 8px;font-size:12px;letter-spacing:.12em;color:var(--muted);font-we
 .btn.primary:disabled{opacity:.55;cursor:progress}
 .home-label{font-weight:700;word-break:break-all}
 .home-label.empty{color:var(--muted);font-weight:500}
+.home-label.pending{color:var(--warn-ink)}                                  /* 住所を入れたが、まだ決まっていない */
+.home-label.err{color:var(--busy)}
 .addr{display:flex;gap:8px;margin-top:8px}
+.addr.pending button[type=submit]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:700}
 .addr input{flex:1;min-width:0;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:8px 10px;min-height:40px}
 .hits{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
 .hits button{width:100%;text-align:left;border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:6px 10px;cursor:pointer}
@@ -198,7 +203,7 @@ input.txt{width:100%;min-width:0;margin-top:10px;border:1px solid var(--line);ba
         <button class="btn" id="btnPick" type="button" aria-pressed="false">地図で選ぶ</button>
       </div>
       <form class="addr" id="addrForm" hidden>
-        <input id="addrInput" type="search" placeholder="例：千葉市中央区 市場町1-1" aria-label="住所または駅名">
+        <input id="addrInput" type="search" placeholder="例：千葉駅、千葉市中央区 市場町1-1" aria-label="住所または駅名" autocomplete="off">
         <button class="btn" type="submit">検索</button>
       </form>
       <ul class="hits" id="hits"></ul>
@@ -224,7 +229,7 @@ input.txt{width:100%;min-width:0;margin-top:10px;border:1px solid var(--line);ba
         <button class="btn" id="btnDestClear" type="button">消す</button>
       </div>
       <form class="addr" id="destForm" hidden>
-        <input id="destInput" type="search" placeholder="例：稲毛海浜公園、千葉駅" aria-label="目的地の場所名または住所">
+        <input id="destInput" type="search" placeholder="例：稲毛海浜公園、千葉駅" aria-label="目的地の場所名または住所" autocomplete="off">
         <button class="btn" type="submit">検索</button>
       </form>
       <ul class="hits" id="destHits"></ul>
@@ -1013,8 +1018,8 @@ function setHome(lat, lon, label, fly){
 map.on('click', ev => {
   if(!S.pick) return;
   const t = S.pick; setPick(false);
-  if(t === 'dest'){ setDest(ev.latlng.lat, ev.latlng.lng, '地図で選んだ目的地', false); toast('目的地を設定しました'); }
-  else{ setHome(ev.latlng.lat, ev.latlng.lng, '地図で選んだ場所', false); toast('出発地を設定しました'); }
+  if(t === 'dest'){ destSearch.reset(); setDest(ev.latlng.lat, ev.latlng.lng, '地図で選んだ目的地', false); toast('目的地を設定しました'); }
+  else{ homeSearch.reset(); setHome(ev.latlng.lat, ev.latlng.lng, '地図で選んだ場所', false); toast('出発地を設定しました'); }
 });
 function setPick(on, target){
   S.pick = on ? (target || 'home') : false;
@@ -1030,14 +1035,10 @@ $('btnGps').addEventListener('click', () => {
   if(!navigator.geolocation){ toast('この端末では現在地を取得できません'); return; }
   setStatus('現在地を取得しています…');
   navigator.geolocation.getCurrentPosition(
-    p => { setStatus(''); setHome(p.coords.latitude, p.coords.longitude, '現在地', true); },
+    p => { setStatus(''); homeSearch.reset(); setHome(p.coords.latitude, p.coords.longitude, '現在地', true); },
     () => { setStatus('現在地を取得できませんでした。位置情報の許可を確認するか、住所で探してください。', true); },
     {enableHighAccuracy:true, timeout:15000}
   );
-});
-$('btnAddr').addEventListener('click', () => {
-  const f = $('addrForm'); f.hidden = !f.hidden; $('btnAddr').setAttribute('aria-expanded', !f.hidden);
-  if(!f.hidden) $('addrInput').focus();
 });
 async function geocode(q){
   let list = [];
@@ -1055,24 +1056,81 @@ async function geocode(q){
   }
   return list;
 }
-function bindSearch(formId, inputId, hitsId, onPick){
-  $(formId).addEventListener('submit', async ev => {
-    ev.preventDefault();
-    const q = $(inputId).value.trim(); if(!q) return;
-    const hits = $(hitsId); hits.textContent = '';
-    setStatus('場所を検索しています…');
-    const list = await geocode(q);
-    if(!list.length){ setStatus('見つかりませんでした。町名や駅名で試すか、地図で選んでください。', true); return; }
-    setStatus('');
-    for(const h of list){
-      const li = document.createElement('li'); const b = document.createElement('button'); b.type='button'; b.textContent = h.label;
-      b.addEventListener('click', () => { hits.textContent=''; $(formId).hidden = true; onPick(h); });
+/* ---------- 住所・場所名の検索欄（出発地と目的地で共通） ----------
+   文字を入れて手が止まると自動で候補を出す。Enter・検索ボタン・欄から離れる・欄を閉じる・コースを探す・出発地に戻る、
+   のどれかで候補の1番目を採用する（複数あっても1番目。候補は残すので、タップで差し替えられる）。
+   確定するまでは、ラベルに「候補から選んでください」などの注意を出す */
+function placeSearch(cfg){
+  // cfg: formId / inputId / hitsId / btnId（開閉ボタン）/ labelId / what（'出発地'か'目的地'）/ apply(候補) 採用する / base() ラベルを元の表示に戻す
+  const form = $(cfg.formId), input = $(cfg.inputId), hits = $(cfg.hitsId), label = $(cfg.labelId), btn = $(cfg.btnId);
+  // q: いま入力されている文字 / list: q の候補（null は未検索）/ chosen: 採用した候補の番号 / applied: 採用済みの文字 /
+  // seq: 検索の通し番号（古い結果を捨てる）/ searching: 進行中の検索 / timer: 入力が止まるのを待つタイマー
+  const st = {q:'', list:null, chosen:-1, applied:'', seq:0, searching:null, timer:null};
+
+  function showLabel(text, cls){ label.textContent = text; label.className = 'home-label '+cls; form.classList.toggle('pending', cls === 'pending'); }
+  function renderHits(){
+    hits.textContent = '';
+    if(!st.list) return;
+    st.list.forEach((h, i) => {
+      const li = document.createElement('li'); const b = document.createElement('button'); b.type = 'button'; b.textContent = h.label;
+      b.setAttribute('aria-pressed', st.applied === st.q && i === st.chosen);
+      b.addEventListener('click', () => { pick(i); open(false); });        // 自分で候補を選んだら欄を閉じる
       li.appendChild(b); hits.appendChild(li);
-    }
+    });
+  }
+  function pick(i){
+    st.chosen = i; st.applied = st.q;
+    cfg.apply(st.list[i]);                                                  // setHome / setDest がラベルに場所名を書く
+    label.classList.remove('pending','err'); form.classList.remove('pending');
+    renderHits();
+  }
+  function lookup(){                                                        // いまの文字で検索して候補を出す。途中で文字が変わっていたら結果は捨てる
+    const q = st.q, seq = ++st.seq;
+    showLabel('「'+q+'」を検索しています…', 'pending');
+    st.searching = geocode(q).then(list => {
+      if(seq !== st.seq) return;
+      st.list = list; st.searching = null; renderHits();
+      if(!list.length) showLabel('「'+q+'」は見つかりませんでした。町名や駅名で試すか、地図で選んでください。', 'err');
+      else showLabel('「'+q+'」の候補から選んでください（選ばなければ1番目を使います）', 'pending');
+    });
+    return st.searching;
+  }
+  // 未確定の入力があれば候補の1番目を採用する。採用できたか、何もすることがなければ true。見つからなければ false
+  async function commit(){
+    if(!st.q || st.applied === st.q) return true;
+    clearTimeout(st.timer);
+    for(let tries = 0; tries < 3 && st.q && !st.list; tries++) await (st.searching || lookup());
+    if(!st.q || st.applied === st.q) return true;                           // 待っている間に消した・選んだ
+    if(!st.list || !st.list.length){ input.focus(); return false; }
+    pick(0);
+    toast('「'+st.list[0].label+'」を'+cfg.what+'にしました');
+    return true;
+  }
+  function open(on){ form.hidden = !on; btn.setAttribute('aria-expanded', on); if(on) input.focus(); }
+  function reset(){                                                         // 現在地や地図で決めたとき：入力と候補を消して欄を閉じる
+    clearTimeout(st.timer); st.q = ''; st.list = null; st.chosen = -1; st.applied = ''; st.seq++; st.searching = null;
+    input.value = ''; hits.textContent = ''; form.classList.remove('pending'); label.classList.remove('pending','err'); open(false);
+  }
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    clearTimeout(st.timer);
+    if(q === st.q) return;
+    st.q = q; st.list = null; st.chosen = -1; st.seq++; st.searching = null; hits.textContent = '';
+    if(!q){ cfg.base(); form.classList.remove('pending'); return; }        // 消したら元の表示に戻す
+    showLabel('「'+q+'」の候補を探します…', 'pending');
+    st.timer = setTimeout(lookup, 700);
   });
+  form.addEventListener('submit', ev => { ev.preventDefault(); commit(); });
+  input.addEventListener('blur', () => { setTimeout(commit, 150); });     // 候補のタップが先に処理されるよう少し待つ
+  btn.addEventListener('click', () => { if(form.hidden) open(true); else { open(false); commit(); } });
+  return {commit, reset};
 }
-bindSearch('addrForm', 'addrInput', 'hits', h => { $('btnAddr').setAttribute('aria-expanded','false'); setHome(h.lat, h.lon, h.label, true); });
-bindSearch('destForm', 'destInput', 'destHits', h => { $('btnDestAddr').setAttribute('aria-expanded','false'); setDest(h.lat, h.lon, h.label, true); });
+const homeSearch = placeSearch({formId:'addrForm', inputId:'addrInput', hitsId:'hits', btnId:'btnAddr', labelId:'homeLabel', what:'出発地',
+  apply: h => setHome(h.lat, h.lon, h.label, true),
+  base: () => { const el = $('homeLabel'); el.textContent = S.home ? S.home.label : '未設定'; el.className = 'home-label'+(S.home ? '' : ' empty'); }});
+const destSearch = placeSearch({formId:'destForm', inputId:'destInput', hitsId:'destHits', btnId:'btnDestAddr', labelId:'destLabel', what:'目的地',
+  apply: h => setDest(h.lat, h.lon, h.label, true),
+  base: () => { const el = $('destLabel'); el.textContent = S.dest ? S.dest.label : '未設定'; el.className = 'home-label'+(S.dest ? '' : ' empty'); }});
 
 /* 条件 */
 function updateEst(){
@@ -1342,7 +1400,12 @@ async function search(alt){
   }
 }
 // 「コースを探す」はタブに応じて一周／目的地を探す
-$('go').addEventListener('click', () => S.mode === 'dest' ? searchDest(false) : search(false));
+// 住所の欄に未確定の入力が残っていれば、先に候補の1番目を採用してから探す
+$('go').addEventListener('click', async () => {
+  if(!await homeSearch.commit()) return;
+  if(S.mode === 'dest' && !await destSearch.commit()) return;
+  S.mode === 'dest' ? searchDest(false) : search(false);
+});
 // 「別のコースを探す」は、タブではなく表示中のコースと同じ種類で探す（結果を見たあとにタブを切り替えても種類が変わらないように）
 $('btnAlt').addEventListener('click', () => {
   const r = S.routes[S.sel]; if(!r) return;
@@ -1366,15 +1429,12 @@ function setDest(lat, lon, label, fly){
 }
 function clearDest(){
   S.dest = null; if(destMarker){ destMarker.remove(); destMarker = null; }
-  const el = $('destLabel'); el.textContent = '未設定'; el.classList.add('empty');
+  destSearch.reset();
+  const el = $('destLabel'); el.textContent = '未設定'; el.className = 'home-label empty';
   save();
 }
 $('btnDestPick').addEventListener('click', () => setPick(S.pick !== 'dest', 'dest'));
 $('btnDestClear').addEventListener('click', clearDest);
-$('btnDestAddr').addEventListener('click', () => {
-  const f = $('destForm'); f.hidden = !f.hidden; $('btnDestAddr').setAttribute('aria-expanded', !f.hidden);
-  if(!f.hidden) $('destInput').focus();
-});
 $('destMode').addEventListener('click', e => {
   const b = e.target.closest('button[data-v]'); if(!b) return;
   S.destMode = b.dataset.v;
@@ -1433,6 +1493,7 @@ async function searchDest(alt){
 // 現在地から出発地まで、いまの設定（安全な横断・緑の優先）で戻る道を出す
 async function backHome(){
   if(busy) return;
+  if(!await homeSearch.commit()) return;                                 // 住所の欄に未確定の入力があれば先に採用する
   if(!S.home){ toast('先に出発地を設定してください'); return; }
   if(!navigator.geolocation){ toast('この端末では現在地を取得できません'); return; }
   setBusy(true); setProgress(null); setStatus('現在地を確認しています…');
